@@ -172,6 +172,25 @@ screcord/
     └── Types.swift
 ```
 
+## Agent-native
+
+This repo is set up for Cursor (and similar) agents:
+
+| Path | Purpose |
+|------|---------|
+| [`AGENTS.md`](AGENTS.md) | Entrypoint for coding agents |
+| [`.cursor/skills/screcord/`](.cursor/skills/screcord/) | Skill: record screens / pick displays |
+| [`.cursor/skills/screcord-dev/`](.cursor/skills/screcord-dev/) | Skill: extend the Swift recorder |
+| [`.cursor/rules/screcord.mdc`](.cursor/rules/screcord.mdc) | Always-on project conventions |
+| [`Scripts/agent-record.sh`](Scripts/agent-record.sh) | Unattended recordings (`--duration` required) |
+
+Example agent capture:
+
+```bash
+./Scripts/agent-record.sh --duration 15 --display 0 --audio system \
+  --output ~/Desktop/agent-demo.mp4
+```
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome.

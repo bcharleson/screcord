@@ -1,0 +1,20 @@
+---
+description: screcord project conventions — agent-native macOS screen recorder
+alwaysApply: true
+---
+
+# screcord
+
+This repo is **screcord**: a zero-dependency Swift CLI screen recorder (ScreenCaptureKit + AVFoundation).
+
+## Skills (read when relevant)
+
+- Recording / demos / which display: [.cursor/skills/screcord/SKILL.md](../skills/screcord/SKILL.md)
+- Changing code / features / build: [.cursor/skills/screcord-dev/SKILL.md](../skills/screcord-dev/SKILL.md)
+
+## Defaults
+
+- Build with `make build` (not bare `swift build`)
+- Keep zero third-party Swift packages
+- Separate audio writer inputs for system vs microphone
+- Update CLI help + README + skills when UX changes
