@@ -276,6 +276,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        // Fragmented MP4: flush the index every 5s so a crash, kill, or failed
+        // finalize loses at most the last fragment instead of the whole take.
+        writer.movieFragmentInterval = CMTime(seconds: 5, preferredTimescale: 600)
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,

@@ -45,6 +45,8 @@ final class WebcamRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         }
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        // Fragmented MP4: crash-safe incremental index (see ScreenRecorder).
+        writer.movieFragmentInterval = CMTime(seconds: 5, preferredTimescale: 600)
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: 1280,
