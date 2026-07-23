@@ -171,19 +171,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         let excluded = options.excludeSelf ? excludedApps(from: content) : []
 
         if let windowQuery = options.windowQuery {
-            let windows = content.windows.filter { window in
-                let title = window.title ?? ""
-                let app = window.owningApplication?.applicationName ?? ""
-                let q = windowQuery.lowercased()
-                return title.lowercased().contains(q) || app.lowercased().contains(q)
-            }
-            guard let window = windows.first else {
-                throw ScrecordError.unsupported("No window matching '\(windowQuery)'. Run: screcord windows")
-            }
+            let window = try WindowCatalog.scWindow(matching: windowQuery, in: content)
             let filter = SCContentFilter(desktopIndependentWindow: window)
             let size = window.frame.size
             let title = window.title ?? "window"
-            return FilterResult(filter: filter, contentSize: size, label: "window: \(title)")
+            let app = window.owningApplication?.applicationName ?? "?"
+            return FilterResult(filter: filter, contentSize: size, label: "window: \(app) — \(title)")
         }
 
         if let appQuery = options.appQuery {

@@ -14,10 +14,12 @@ enum ScrecordApp {
                 print("screcord \(CLI.version)")
             case .devices:
                 try await DeviceLister.listAll()
-            case .windows:
-                try await DeviceLister.listWindows()
+            case .windows(let filter):
+                try await DeviceLister.listWindows(filter: filter)
             case .identify(let seconds):
                 try await DisplayIdentifier.flash(seconds: seconds)
+            case .identifyWindows(let seconds, let filter):
+                try await WindowIdentifier.flash(seconds: seconds, filter: filter)
             case .record(let options):
                 try await runRecording(options)
             }

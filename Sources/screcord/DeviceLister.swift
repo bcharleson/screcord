@@ -55,14 +55,13 @@ enum DeviceLister {
         print("Permissions: Screen & System Audio Recording + Microphone (if needed) for your terminal app.")
     }
 
-    static func listWindows() async throws {
+    static func listWindows(filter: String? = nil) async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        let windows = content.windows
-            .filter { ($0.title?.isEmpty == false) }
-            .sorted { ($0.owningApplication?.applicationName ?? "") < ($1.owningApplication?.applicationName ?? "") }
+        let windows = WindowCatalog.list(from: content, filter: filter)
 
         print("=== Windows / Apps ===")
-        print("Use: screcord record --window \"Title\"   or   --app \"Safari\"")
+        print("Tip: run `screcord identify-windows` to flash indexes on each window.")
+        print("Use: screcord record --window 3   or   --window \"Notion\"   or   --app \"Safari\"")
         print("")
 
         if windows.isEmpty {
@@ -71,12 +70,14 @@ enum DeviceLister {
         }
 
         var seenApps = Set<String>()
-        for window in windows.prefix(80) {
-            let app = window.owningApplication?.applicationName ?? "?"
-            let bundle = window.owningApplication?.bundleIdentifier ?? ""
-            let title = window.title ?? "(untitled)"
-            print("  • \(app) — \(title)")
-            if !bundle.isEmpty { seenApps.insert("\(app)|\(bundle)") }
+        for info in windows.prefix(80) {
+            print("  [\(info.index)] \(info.appName) — \(info.title)")
+            if !info.bundleID.isEmpty {
+                seenApps.insert("\(info.appName)|\(info.bundleID)")
+            }
+        }
+        if windows.count > 80 {
+            print("  … +\(windows.count - 80) more")
         }
 
         print("")

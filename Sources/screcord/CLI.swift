@@ -5,12 +5,13 @@ struct CLI {
         case help
         case version
         case devices
-        case windows
+        case windows(filter: String?)
         case identify(seconds: Double)
+        case identifyWindows(seconds: Double, filter: String?)
         case record(RecordOptions)
     }
 
-    static let version = "1.2.0"
+    static let version = "1.2.1"
 
     static func parse(arguments: [String] = Array(CommandLine.arguments.dropFirst())) throws -> Command {
         if arguments.isEmpty { return .help }
@@ -26,9 +27,12 @@ struct CLI {
         case "devices", "list":
             return .devices
         case "windows":
-            return .windows
+            return .windows(filter: try parseOptionalFilter(args))
         case "identify":
-            return .identify(seconds: try parseIdentifySeconds(args))
+            return .identify(seconds: try parseIdentifyOptions(args).seconds)
+        case "identify-windows", "identify-window":
+            let opts = try parseIdentifyOptions(args)
+            return .identifyWindows(seconds: opts.seconds, filter: opts.filter)
         case "record":
             return .record(try parseRecordOptions(args))
         default:
@@ -39,8 +43,28 @@ struct CLI {
         }
     }
 
-    private static func parseIdentifySeconds(_ args: [String]) throws -> Double {
+    private static func parseOptionalFilter(_ args: [String]) throws -> String? {
+        var filter: String?
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--filter", "-f", "--app":
+                i += 1
+                guard i < args.count else {
+                    throw ScrecordError.unsupported("Missing value for \(args[i - 1])")
+                }
+                filter = args[i]
+            default:
+                throw ScrecordError.unsupported("Unknown windows option '\(args[i])'")
+            }
+            i += 1
+        }
+        return filter
+    }
+
+    private static func parseIdentifyOptions(_ args: [String]) throws -> (seconds: Double, filter: String?) {
         var seconds = 3.0
+        var filter: String?
         var i = 0
         while i < args.count {
             switch args[i] {
@@ -50,6 +74,12 @@ struct CLI {
                     throw ScrecordError.unsupported("Invalid identify duration")
                 }
                 seconds = value
+            case "--filter", "-f", "--app":
+                i += 1
+                guard i < args.count else {
+                    throw ScrecordError.unsupported("Missing value for filter")
+                }
+                filter = args[i]
             default:
                 if let value = Double(args[i]), value > 0 {
                     seconds = value
@@ -59,7 +89,7 @@ struct CLI {
             }
             i += 1
         }
-        return seconds
+        return (seconds, filter)
     }
 
     private static func parseRecordOptions(_ args: [String]) throws -> RecordOptions {
@@ -169,14 +199,17 @@ struct CLI {
             screcord \(version) — headless macOS screen recorder for tutorials & YouTube
 
             USAGE:
-              screcord devices | windows | identify [--seconds 3]
+              screcord devices | windows [--filter App]
+              screcord identify [--seconds 3]
+              screcord identify-windows [--seconds 3] [--filter App]
               screcord record [options]
               screcord [options]
 
             COMMANDS:
               devices              List displays + mics (names + placement)
-              windows              List capturable windows/apps
+              windows              List capturable windows/apps (numbered)
               identify             Flash big index badges on each display
+              identify-windows     Flash index badges on each window
               record               Start recording
 
             PRESETS:
@@ -214,11 +247,13 @@ struct CLI {
 
             EXAMPLES:
               screcord identify
+              screcord identify-windows --filter \"Chrome\"
+              screcord windows
+              screcord record --display main
+              screcord record --window 3
+              screcord record --window \"Notion\" --preset clean-ui
               screcord record --preset tutorial --slug auth-flow
               screcord record --preset broll --display main --duration 20
-              screcord record --window \"Notion\" --audio system --meters
-              screcord record --app Safari --preset clean-ui
-              screcord record --audio both --idle-stop 90 --slug talking-head
             """
         )
     }
