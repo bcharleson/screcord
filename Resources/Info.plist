@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.screcord.cli</string>
+	<key>CFBundleName</key>
+	<string>screcord</string>
+	<key>CFBundleDisplayName</key>
+	<string>screcord</string>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>screcord needs microphone access to include your voice in recordings.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>screcord does not use the camera; this key is present for AVFoundation completeness.</string>
+</dict>
+</plist>

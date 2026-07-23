@@ -1,0 +1,19 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release binary
+        run: make build
+      - name: Smoke test CLI
+        run: |
+          ./.build/release/screcord version
+          ./.build/release/screcord help
