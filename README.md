@@ -20,14 +20,19 @@ A lightweight CLI alternative when the built-in **⌘⇧5** recorder misbehaves 
 
 ## Features
 
-- Full display or rectangular region capture
+- Full display, region, **window**, or **app** capture
+- `screcord identify` — flash big index badges on each monitor
+- Display names + placement (`left of main`, etc.) and `--display main|"Name"`
+- Presets: `tutorial` · `broll` · `clean-ui` · `motion`
 - Audio modes: `none` · `system` · `mic` · `both`
-- Show / hide mouse cursor
-- Countdown before recording
-- Clean stop via **Ctrl+C** (or `--duration`)
-- Defaults: **30 fps**, high bitrate H.264, NV12 → yuv420p-friendly encode, AAC 192 kbps
-- Timestamped filenames on your Desktop
-- List displays + microphones
+- **Live loudness meters** in the terminal (catch silent takes)
+- Pause / resume (`p`), chapter markers (`m`) → YouTube timestamp JSON
+- `--idle-stop` after silence · `--slug` filenames · post-record probe
+- Optional `--webcam` companion file for PIP in your editor
+- `--highlight-clicks` · `--exclude-self` (hide terminal from the take)
+- Clean stop via **Ctrl+C** / `q` / `--duration`
+- Defaults: **30 fps**, high bitrate H.264, AAC 192 kbps
+- Zero third-party dependencies · agent skills in `.cursor/skills/`
 
 ## Requirements
 
@@ -75,45 +80,42 @@ The microphone privacy string is embedded in the binary via `Resources/Info.plis
 ## Usage
 
 ```bash
-# List displays and microphones
+# See which screen is which
 screcord devices
+screcord identify
 
-# Record full primary display (system + mic), countdown 3s
-screcord record
+# Tutorial take (mic + system, cursor on)
+screcord record --preset tutorial --slug auth-flow
 
-# System audio only, no cursor
-screcord record --audio system --no-cursor
+# Clean B-roll
+screcord record --preset broll --display main
 
-# Microphone only, 5s countdown
-screcord record --audio mic --countdown 5
+# Single window
+screcord windows
+screcord record --window "Notion" --preset clean-ui
 
-# Region + 60 fps + custom output
-screcord record --region 0,0,1280,720 --fps 60 -o ~/Movies/demo.mp4
-
-# Second display, auto-stop after 30 seconds
-screcord record --display 1 --duration 30
-
-# Shorthand (record is the default when options are passed)
-screcord --audio both --no-cursor
+# Agent / unattended
+screcord record --preset broll --headless --duration 30 --slug demo
 ```
 
-Stop an interactive recording with **Ctrl+C**. The file is finalized cleanly (no truncated MP4).
+While recording in a TTY: **`p`** pause · **`m`** marker · **`q`** / **Ctrl+C** stop.
+
+Live meters look like: `♪ sys: -12.0dB [########....]  mic: -28.0dB [###.........]`
 
 ### Options
 
-| Option | Default | Description |
-|---|---|---|
-| `-d, --display <n>` | `0` | Display index from `screcord devices` |
-| `-r, --region x,y,w,h` | full display | Capture region in **points** |
-| `-a, --audio <mode>` | `both` | `none` \| `system` \| `mic` \| `both` |
-| `--no-cursor` / `--cursor` | cursor on | Hide or show the pointer |
-| `--fps <n>` | `30` | 1–60 |
-| `--bitrate <bps>` | `8000000` | Video bitrate |
-| `--audio-bitrate <bps>` | `192000` | AAC bitrate |
-| `-c, --countdown <sec>` | `3` | Pre-roll countdown |
-| `-t, --duration <sec>` | off | Auto-stop after N seconds |
-| `-o, --output <path>` | `~/Desktop/screcord-TIMESTAMP.mp4` | Output path |
-| `--scale <1\|2\|3>` | `2` | Pixel scale (Retina-friendly) |
+Run `screcord help` for the full list. Highlights:
+
+| Option | Description |
+|---|---|
+| `--preset tutorial\|broll\|clean-ui\|motion` | Opinionated defaults for YouTube work |
+| `-d, --display <n\|name\|main>` | Pick screen by index or name |
+| `-w, --window` / `--app` | Window or app capture |
+| `--meters` / `--no-meters` / `--headless` | Loudness UI |
+| `--idle-stop <sec>` | Auto-stop after silence |
+| `--slug <name>` | Tag Desktop filenames |
+| `--webcam` | Companion `*-cam.mp4` for editor PIP |
+| `--highlight-clicks` | Click ripples (Accessibility) |
 
 ## How it works
 

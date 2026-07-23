@@ -1,3 +1,4 @@
+import Darwin
 import Dispatch
 import Foundation
 
@@ -13,6 +14,10 @@ enum ScrecordApp {
                 print("screcord \(CLI.version)")
             case .devices:
                 try await DeviceLister.listAll()
+            case .windows:
+                try await DeviceLister.listWindows()
+            case .identify(let seconds):
+                try await DisplayIdentifier.flash(seconds: seconds)
             case .record(let options):
                 try await runRecording(options)
             }
@@ -23,20 +28,23 @@ enum ScrecordApp {
     }
 
     private static func runRecording(_ options: RecordOptions) async throws {
-        let outputURL = options.outputURL ?? OutputPath.defaultURL()
-        let outputDir = outputURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        let outputURL = options.outputURL ?? OutputPath.defaultURL(slug: options.slug)
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        let metersEnabled = options.meters ?? (isatty(STDERR_FILENO) != 0)
+        let meter = AudioMeter(enabled: metersEnabled)
 
         print("screcord \(CLI.version)")
-        print("Display:  \(options.displayIndex)")
-        if let region = options.region {
-            print("Region:   \(Int(region.x)),\(Int(region.y)) \(Int(region.width))x\(Int(region.height))")
-        } else {
-            print("Region:   full display")
+        if let preset = options.preset {
+            print("Preset:   \(preset.rawValue)")
         }
         print("Audio:    \(options.audioMode.rawValue)")
-        print("Cursor:   \(options.showCursor ? "on" : "off")")
+        print("Cursor:   \(options.showCursor ? "on" : "off")\(options.highlightClicks ? " + click highlights" : "")")
         print("FPS:      \(options.fps)")
+        print("Meters:   \(metersEnabled ? "on" : "off")")
         print("Output:   \(outputURL.path)")
         print("")
 
@@ -47,29 +55,59 @@ enum ScrecordApp {
             }
         }
 
-        let recorder = ScreenRecorder(options: options, outputURL: outputURL)
+        let recorder = ScreenRecorder(options: options, outputURL: outputURL, meter: meter)
         try await recorder.start()
-        print("Recording… press Ctrl+C to stop")
+        print("Target:   \(recorder.resolvedTargetDescription)")
+        print("Size:     \(recorder.outputWidth)x\(recorder.outputHeight)")
+
+        var webcam: WebcamRecorder?
+        if options.recordWebcam {
+            try await Permissions.ensureCameraAccess()
+            let base = outputURL.deletingPathExtension().lastPathComponent
+            let companion = outputURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("\(base)-cam.mp4")
+            let cam = WebcamRecorder(outputURL: companion)
+            try cam.start()
+            webcam = cam
+            print("Webcam:   \(companion.path)")
+        }
+
+        let clickHighlighter = ClickHighlighter()
+        if options.highlightClicks {
+            await MainActor.run { clickHighlighter.start() }
+        }
+
+        meter.start()
+        print("Recording…")
 
         let stopSignal = StopSignal.shared
         stopSignal.install()
 
-        if let duration = options.duration {
-            let nanos = UInt64(duration * 1_000_000_000)
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    try? await Task.sleep(nanoseconds: nanos)
-                    stopSignal.requestStop(reason: "duration elapsed")
-                }
-                group.addTask {
-                    await stopSignal.wait()
-                }
-                await group.next()
-                group.cancelAll()
-            }
-        } else {
-            await stopSignal.wait()
-        }
+        var markers: [ChapterMarker] = []
+        let controls = RecordingControls(
+            onPauseToggle: { recorder.togglePause() },
+            onMarker: {
+                let seconds = recorder.timelineSeconds
+                let label = "Marker \(markers.count + 1)"
+                markers.append(ChapterMarker(seconds: seconds, label: label))
+                fputs(String(format: "\n✎ marker %.1fs — %@\n", seconds, label), stderr)
+            },
+            onQuit: { stopSignal.requestStop(reason: "quit key") }
+        )
+        controls.startIfTTY()
+
+        await waitForStopPumpingRunLoop(
+            stopSignal: stopSignal,
+            duration: options.duration,
+            idleStop: options.idleStop,
+            meter: meter,
+            audioEnabled: options.audioMode != .none
+        )
+
+        controls.stop()
+        meter.stop()
+        clickHighlighter.stop()
 
         if let reason = stopSignal.reason {
             print("\nStopping (\(reason))…")
@@ -77,14 +115,58 @@ enum ScrecordApp {
             print("\nStopping…")
         }
 
+        if ProcessInfo.processInfo.environment["SCRECORD_DEBUG"] == "1" {
+            fputs("debug: \(recorder.debugSummary())\n", stderr)
+        }
+
         let url = try await recorder.stop()
-        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
-        let sizeMB = Double(size) / 1_048_576.0
-        print(String(format: "Saved %.2f MB → %@", sizeMB, url.path))
+        if let webcam, let camURL = try await webcam.stop() {
+            print("Webcam saved → \(camURL.path)")
+        }
+
+        try MarkerStore.writeSidecar(for: url, markers: markers)
+        await RecordingProbe.printReport(for: url)
+    }
+
+    /// ScreenCaptureKit needs the main run loop serviced while recording.
+    private static func waitForStopPumpingRunLoop(
+        stopSignal: StopSignal,
+        duration: Double?,
+        idleStop: Double?,
+        meter: AudioMeter,
+        audioEnabled: Bool
+    ) async {
+        let startedAt = Date()
+        var nextMeterLog = Date().addingTimeInterval(1)
+
+        while !stopSignal.isStopped {
+            if let duration, Date().timeIntervalSince(startedAt) >= duration {
+                stopSignal.requestStop(reason: "duration elapsed")
+                break
+            }
+
+            if let idleStop, audioEnabled, Date().timeIntervalSince(startedAt) > 5 {
+                if meter.secondsSinceLoudAudio() >= idleStop {
+                    stopSignal.requestStop(reason: "idle silence")
+                    break
+                }
+            }
+
+            if Date() >= nextMeterLog {
+                meter.logLineIfNeeded()
+                nextMeterLog = Date().addingTimeInterval(1)
+            }
+
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.main.async {
+                    RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+                    continuation.resume()
+                }
+            }
+        }
     }
 }
 
-/// Process-wide Ctrl+C / SIGTERM bridge for async code.
 final class StopSignal: @unchecked Sendable {
     static let shared = StopSignal()
 
@@ -94,20 +176,22 @@ final class StopSignal: @unchecked Sendable {
     private(set) var reason: String?
     private var sources: [DispatchSourceSignal] = []
 
+    var isStopped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped
+    }
+
     func install() {
         signal(SIGINT, SIG_IGN)
         signal(SIGTERM, SIG_IGN)
 
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        sigint.setEventHandler { [weak self] in
-            self?.requestStop(reason: "SIGINT")
-        }
+        sigint.setEventHandler { [weak self] in self?.requestStop(reason: "SIGINT") }
         sigint.resume()
 
         let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        sigterm.setEventHandler { [weak self] in
-            self?.requestStop(reason: "SIGTERM")
-        }
+        sigterm.setEventHandler { [weak self] in self?.requestStop(reason: "SIGTERM") }
         sigterm.resume()
 
         sources = [sigint, sigterm]

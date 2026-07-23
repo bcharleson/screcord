@@ -17,6 +17,6 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>screcord needs microphone access to include your voice in recordings.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>screcord does not use the camera; this key is present for AVFoundation completeness.</string>
+	<string>screcord can optionally record a companion webcam MP4 for picture-in-picture in your editor.</string>
 </dict>
 </plist>

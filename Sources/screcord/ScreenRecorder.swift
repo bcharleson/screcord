@@ -1,15 +1,20 @@
 import AVFoundation
 import CoreMedia
+import CoreVideo
+import Darwin
 import Foundation
+import QuartzCore
 import ScreenCaptureKit
 
 final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let options: RecordOptions
     private let outputURL: URL
+    let meter: AudioMeter
 
     private var stream: SCStream?
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
+    private var videoAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var systemAudioInput: AVAssetWriterInput?
     private var micAudioInput: AVAssetWriterInput?
 
@@ -17,16 +22,60 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var didStartSession = false
     private var isStopping = false
     private var sessionStartPTS: CMTime = .invalid
+    private var lastWrittenPTS: CMTime = .invalid
 
-    // AVFoundation mic fallback (macOS < 15)
+    private var isPaused = false
+    private var pauseStartedHost: CFTimeInterval?
+    private var pausedSeconds: Double = 0
+
     private var captureSession: AVCaptureSession?
     private var micOutput: AVCaptureAudioDataOutput?
     private var micAnchorPTS: CMTime = .invalid
 
-    init(options: RecordOptions, outputURL: URL) {
+    private(set) var resolvedTargetDescription = ""
+    private(set) var outputWidth = 0
+    private(set) var outputHeight = 0
+    private var lastPixelBuffer: CVPixelBuffer?
+    private var debugFrameCount = 0
+    private var debugCompleteCount = 0
+    private var debugAppendCount = 0
+    private var debugDropNotReady = 0
+    private var debugStatusHistogram: [String: Int] = [:]
+    private let debugEnabled = ProcessInfo.processInfo.environment["SCRECORD_DEBUG"] == "1"
+
+    init(options: RecordOptions, outputURL: URL, meter: AudioMeter) {
         self.options = options
         self.outputURL = outputURL
+        self.meter = meter
         super.init()
+    }
+
+    var isPausedState: Bool {
+        sampleQueue.sync { isPaused }
+    }
+
+    var timelineSeconds: Double {
+        sampleQueue.sync {
+            guard sessionStartPTS.isValid, lastWrittenPTS.isValid else { return 0 }
+            return CMTimeGetSeconds(CMTimeSubtract(lastWrittenPTS, sessionStartPTS))
+        }
+    }
+
+    func togglePause() {
+        sampleQueue.async {
+            if self.isPaused {
+                if let start = self.pauseStartedHost {
+                    self.pausedSeconds += CACurrentMediaTime() - start
+                }
+                self.pauseStartedHost = nil
+                self.isPaused = false
+                fputs("\n▶ resumed\n", stderr)
+            } else {
+                self.isPaused = true
+                self.pauseStartedHost = CACurrentMediaTime()
+                fputs("\n⏸ paused (press p to resume)\n", stderr)
+            }
+        }
     }
 
     func start() async throws {
@@ -35,19 +84,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
 
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        let displays = DisplayResolver.ordered(content.displays)
-        guard !displays.isEmpty else { throw ScrecordError.noDisplays }
-        guard options.displayIndex >= 0, options.displayIndex < displays.count else {
-            throw ScrecordError.invalidDisplayIndex(options.displayIndex, available: displays.count)
-        }
-
-        let display = displays[options.displayIndex]
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-        let config = try makeStreamConfiguration(display: display)
+        let filterResult = try Self.makeFilter(content: content, options: options)
+        resolvedTargetDescription = filterResult.label
+        let config = try makeStreamConfiguration(contentSize: filterResult.contentSize)
 
         try prepareWriter(width: config.width, height: config.height)
+        outputWidth = config.width
+        outputHeight = config.height
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        let stream = SCStream(filter: filterResult.filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
 
         if options.audioMode.capturesSystemAudio {
@@ -70,6 +115,11 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             sampleQueue.async {
                 self.isStopping = true
+                if self.isPaused, let start = self.pauseStartedHost {
+                    self.pausedSeconds += CACurrentMediaTime() - start
+                    self.pauseStartedHost = nil
+                    self.isPaused = false
+                }
                 continuation.resume()
             }
         }
@@ -109,9 +159,77 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return outputURL
     }
 
+    // MARK: - Filter
+
+    private struct FilterResult {
+        var filter: SCContentFilter
+        var contentSize: CGSize
+        var label: String
+    }
+
+    private static func makeFilter(content: SCShareableContent, options: RecordOptions) throws -> FilterResult {
+        let excluded = options.excludeSelf ? excludedApps(from: content) : []
+
+        if let windowQuery = options.windowQuery {
+            let windows = content.windows.filter { window in
+                let title = window.title ?? ""
+                let app = window.owningApplication?.applicationName ?? ""
+                let q = windowQuery.lowercased()
+                return title.lowercased().contains(q) || app.lowercased().contains(q)
+            }
+            guard let window = windows.first else {
+                throw ScrecordError.unsupported("No window matching '\(windowQuery)'. Run: screcord windows")
+            }
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let size = window.frame.size
+            let title = window.title ?? "window"
+            return FilterResult(filter: filter, contentSize: size, label: "window: \(title)")
+        }
+
+        if let appQuery = options.appQuery {
+            let apps = content.applications.filter {
+                $0.applicationName.lowercased().contains(appQuery.lowercased())
+                    || $0.bundleIdentifier.lowercased().contains(appQuery.lowercased())
+            }
+            guard let app = apps.first else {
+                throw ScrecordError.unsupported("No app matching '\(appQuery)'. Run: screcord windows")
+            }
+            let displays = DisplayResolver.ordered(content.displays)
+            guard let display = displays.first else { throw ScrecordError.noDisplays }
+            let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+            return FilterResult(
+                filter: filter,
+                contentSize: CGSize(width: display.width, height: display.height),
+                label: "app: \(app.applicationName)"
+            )
+        }
+
+        let resolved = try DisplayCatalog.resolve(options.displayQuery, in: content.displays)
+        let display = resolved.display
+        let filter = SCContentFilter(display: display, excludingApplications: excluded, exceptingWindows: [])
+        let info = DisplayCatalog.infos(from: content.displays).first { $0.displayID == display.displayID }
+        let name = info?.name ?? "display \(resolved.index)"
+        return FilterResult(
+            filter: filter,
+            contentSize: CGSize(width: display.width, height: display.height),
+            label: "display[\(resolved.index)] \(name)"
+        )
+    }
+
+    private static func excludedApps(from content: SCShareableContent) -> [SCRunningApplication] {
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let denyNames = ["terminal", "iterm", "warp", "kitty", "alacritty", "ghostty", "code", "cursor"]
+        return content.applications.filter { app in
+            if app.processID == currentPID { return true }
+            let name = app.applicationName.lowercased()
+            let bundle = app.bundleIdentifier.lowercased()
+            return denyNames.contains { name.contains($0) || bundle.contains($0) }
+        }
+    }
+
     // MARK: - Configuration
 
-    private func makeStreamConfiguration(display: SCDisplay) throws -> SCStreamConfiguration {
+    private func makeStreamConfiguration(contentSize: CGSize) throws -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         let scale = max(1, options.scale)
 
@@ -122,16 +240,16 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             config.height = max(2, Int(rect.height) * scale)
         } else {
             let maxWidth = 3840
-            let targetWidth = min(display.width * scale, maxWidth)
+            let targetWidth = min(Int(contentSize.width) * scale, maxWidth)
             let targetHeight = Int(
-                (Double(targetWidth) * Double(display.height) / Double(display.width)).rounded()
+                (Double(targetWidth) * contentSize.height / max(contentSize.width, 1)).rounded()
             )
-            config.width = targetWidth
+            config.width = max(2, targetWidth)
             config.height = max(2, targetHeight)
         }
 
-        config.width = config.width - (config.width % 2)
-        config.height = config.height - (config.height % 2)
+        config.width -= config.width % 2
+        config.height -= config.height % 2
 
         let fps = max(1, min(60, options.fps))
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
@@ -155,8 +273,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-
-        let videoSettings: [String: Any] = [
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
@@ -166,29 +283,31 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 AVVideoExpectedSourceFrameRateKey: options.fps,
                 AVVideoMaxKeyFrameIntervalKey: options.fps * 2
             ]
-        ]
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        ])
         videoInput.expectsMediaDataInRealTime = true
-        guard writer.canAdd(videoInput) else {
-            throw ScrecordError.writerFailed("Cannot add video input.")
-        }
+        guard writer.canAdd(videoInput) else { throw ScrecordError.writerFailed("Cannot add video input.") }
         writer.add(videoInput)
         self.videoInput = videoInput
+        // Pixel-buffer adaptor + copy avoids ScreenCaptureKit recycling buffers mid-encode.
+        self.videoAdaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height
+            ]
+        )
 
         if options.audioMode.capturesSystemAudio {
             let input = makeAudioInput()
-            guard writer.canAdd(input) else {
-                throw ScrecordError.writerFailed("Cannot add system audio input.")
-            }
+            guard writer.canAdd(input) else { throw ScrecordError.writerFailed("Cannot add system audio input.") }
             writer.add(input)
             systemAudioInput = input
         }
 
         if options.audioMode.capturesMicrophone {
             let input = makeAudioInput()
-            guard writer.canAdd(input) else {
-                throw ScrecordError.writerFailed("Cannot add microphone audio input.")
-            }
+            guard writer.canAdd(input) else { throw ScrecordError.writerFailed("Cannot add microphone audio input.") }
             writer.add(input)
             micAudioInput = input
         }
@@ -197,41 +316,33 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     private func makeAudioInput() -> AVAssetWriterInput {
-        let settings: [String: Any] = [
+        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 48_000,
             AVNumberOfChannelsKey: 2,
             AVEncoderBitRateKey: options.audioBitrate
-        ]
-        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+        ])
         input.expectsMediaDataInRealTime = true
         return input
     }
 
-    // MARK: - Legacy mic (macOS 13/14)
+    // MARK: - Legacy mic
 
     private func startLegacyMicrophoneCapture() throws {
         let session = AVCaptureSession()
         session.beginConfiguration()
-
         guard let device = AVCaptureDevice.default(for: .audio) else {
             throw ScrecordError.unsupported("No default microphone found.")
         }
         let micInput = try AVCaptureDeviceInput(device: device)
-        guard session.canAddInput(micInput) else {
-            throw ScrecordError.unsupported("Cannot add microphone input.")
-        }
+        guard session.canAddInput(micInput) else { throw ScrecordError.unsupported("Cannot add microphone input.") }
         session.addInput(micInput)
-
         let output = AVCaptureAudioDataOutput()
         output.setSampleBufferDelegate(self, queue: sampleQueue)
-        guard session.canAddOutput(output) else {
-            throw ScrecordError.unsupported("Cannot add microphone output.")
-        }
+        guard session.canAddOutput(output) else { throw ScrecordError.unsupported("Cannot add microphone output.") }
         session.addOutput(output)
         session.commitConfiguration()
         session.startRunning()
-
         captureSession = session
         micOutput = output
     }
@@ -242,7 +353,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         micOutput = nil
     }
 
-    // MARK: - Sample handling
+    // MARK: - Samples
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard CMSampleBufferDataIsReady(sampleBuffer), !isStopping else { return }
@@ -251,8 +362,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         case .screen:
             handleVideo(sampleBuffer)
         case .audio:
+            meter.observe(sampleBuffer: sampleBuffer, isMicrophone: false)
             handleAudio(sampleBuffer, input: systemAudioInput)
         case .microphone:
+            meter.observe(sampleBuffer: sampleBuffer, isMicrophone: true)
             handleAudio(sampleBuffer, input: micAudioInput)
         @unknown default:
             break
@@ -264,31 +377,240 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     private func handleVideo(_ sampleBuffer: CMSampleBuffer) {
-        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-              let statusRaw = attachments.first?[.status] as? Int,
-              let status = SCFrameStatus(rawValue: statusRaw),
-              status == .complete
-        else {
+        debugFrameCount += 1
+        guard !isPaused else { return }
+
+        let frameKind = frameKind(for: sampleBuffer)
+        debugStatusHistogram[frameKind.label, default: 0] += 1
+
+        let originalPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let offset = currentPauseOffsetSeconds()
+        let pts = offset > 0.000_5
+            ? CMTimeSubtract(originalPTS, CMTime(seconds: offset, preferredTimescale: 600))
+            : originalPTS
+
+        if lastWrittenPTS.isValid, CMTimeCompare(pts, lastWrittenPTS) <= 0 {
             return
         }
 
-        ensureSessionStarted(with: sampleBuffer)
-        guard let videoInput, videoInput.isReadyForMoreMediaData else { return }
-        videoInput.append(sampleBuffer)
+        switch frameKind {
+        case .complete(let imageBuffer):
+            debugCompleteCount += 1
+            if let cloned = clonePixelBuffer(imageBuffer) {
+                lastPixelBuffer = cloned
+                append(pixelBuffer: cloned, pts: pts)
+            }
+        case .idle:
+            // Static UI: SCK emits idle without a new surface — repeat last frame.
+            if let lastPixelBuffer {
+                append(pixelBuffer: lastPixelBuffer, pts: pts)
+            }
+        case .drop:
+            return
+        }
+    }
+
+    private enum FrameKind {
+        case complete(CVPixelBuffer)
+        case idle
+        case drop
+
+        var label: String {
+            switch self {
+            case .complete: return "complete"
+            case .idle: return "idle"
+            case .drop: return "drop"
+            }
+        }
+    }
+
+    private func frameKind(for sampleBuffer: CMSampleBuffer) -> FrameKind {
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let attachments = attachmentsArray.first
+        else {
+            if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                return .complete(imageBuffer)
+            }
+            return .drop
+        }
+
+        let statusRaw: Int?
+        if let value = attachments[.status] as? Int {
+            statusRaw = value
+        } else if let number = attachments[.status] as? NSNumber {
+            statusRaw = number.intValue
+        } else {
+            statusRaw = nil
+        }
+
+        if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            // Prefer any buffer that still has pixels.
+            if let statusRaw, let status = SCFrameStatus(rawValue: statusRaw), status != .complete, status != .idle {
+                return .drop
+            }
+            return .complete(imageBuffer)
+        }
+
+        if let statusRaw, let status = SCFrameStatus(rawValue: statusRaw), status == .idle {
+            return .idle
+        }
+        // rawValue 1 is idle on current SDKs even when enum bridging is odd.
+        if statusRaw == 1 {
+            return .idle
+        }
+        return .drop
+    }
+
+    private func append(pixelBuffer: CVPixelBuffer, pts: CMTime) {
+        ensureSessionStarted(at: pts)
+        guard let videoInput, let videoAdaptor else { return }
+        guard videoInput.isReadyForMoreMediaData else {
+            debugDropNotReady += 1
+            return
+        }
+        if videoAdaptor.append(pixelBuffer, withPresentationTime: pts) {
+            debugAppendCount += 1
+            lastWrittenPTS = pts
+        } else if debugEnabled, debugFrameCount <= 8 {
+            let err = writer?.error?.localizedDescription ?? "nil"
+            fputs(
+                "debug append fail #\(debugFrameCount) pts=\(CMTimeGetSeconds(pts)) err=\(err)\n",
+                stderr
+            )
+        }
+    }
+
+    private func clonePixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {
+        var dst: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            CVPixelBufferGetWidth(src),
+            CVPixelBufferGetHeight(src),
+            CVPixelBufferGetPixelFormatType(src),
+            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+            &dst
+        )
+        guard status == kCVReturnSuccess, let dst else { return nil }
+
+        CVPixelBufferLockBaseAddress(src, .readOnly)
+        CVPixelBufferLockBaseAddress(dst, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(dst, [])
+            CVPixelBufferUnlockBaseAddress(src, .readOnly)
+        }
+
+        let planeCount = CVPixelBufferGetPlaneCount(src)
+        if planeCount > 0 {
+            for plane in 0..<planeCount {
+                guard let srcBase = CVPixelBufferGetBaseAddressOfPlane(src, plane),
+                      let dstBase = CVPixelBufferGetBaseAddressOfPlane(dst, plane)
+                else { return nil }
+                let height = CVPixelBufferGetHeightOfPlane(src, plane)
+                let srcStride = CVPixelBufferGetBytesPerRowOfPlane(src, plane)
+                let dstStride = CVPixelBufferGetBytesPerRowOfPlane(dst, plane)
+                let bytes = min(srcStride, dstStride)
+                for row in 0..<height {
+                    memcpy(dstBase.advanced(by: row * dstStride), srcBase.advanced(by: row * srcStride), bytes)
+                }
+            }
+            return dst
+        }
+
+        guard let srcBase = CVPixelBufferGetBaseAddress(src),
+              let dstBase = CVPixelBufferGetBaseAddress(dst)
+        else { return nil }
+        let height = CVPixelBufferGetHeight(src)
+        let srcStride = CVPixelBufferGetBytesPerRow(src)
+        let dstStride = CVPixelBufferGetBytesPerRow(dst)
+        let bytes = min(srcStride, dstStride)
+        for row in 0..<height {
+            memcpy(dstBase.advanced(by: row * dstStride), srcBase.advanced(by: row * srcStride), bytes)
+        }
+        return dst
+    }
+
+    func debugSummary() -> String {
+        "frames=\(debugFrameCount) complete=\(debugCompleteCount) appended=\(debugAppendCount) notReady=\(debugDropNotReady) statuses=\(debugStatusHistogram) writer=\(writer?.status.rawValue ?? -1)"
+    }
+
+    private func isCompleteVideoFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let attachments = attachmentsArray.first
+        else {
+            debugStatusHistogram["no-attachments", default: 0] += 1
+            return true
+        }
+
+        let statusRaw: Int?
+        if let value = attachments[.status] as? Int {
+            statusRaw = value
+        } else if let number = attachments[.status] as? NSNumber {
+            statusRaw = number.intValue
+        } else if let value = attachments[SCStreamFrameInfo.status] as? Int {
+            statusRaw = value
+        } else {
+            statusRaw = nil
+        }
+
+        guard let statusRaw else {
+            debugStatusHistogram["nil-status", default: 0] += 1
+            return true
+        }
+        guard let status = SCFrameStatus(rawValue: statusRaw) else {
+            debugStatusHistogram["unknown-\(statusRaw)", default: 0] += 1
+            return statusRaw == 0 // be permissive
+        }
+        debugStatusHistogram["\(status)", default: 0] += 1
+        // `idle` = screen unchanged but buffer still valid — required for static tutorial UIs.
+        // Skipping idle produces tiny files whenever nothing is animating.
+        switch status {
+        case .complete, .idle:
+            return CMSampleBufferGetImageBuffer(sampleBuffer) != nil
+        default:
+            return false
+        }
     }
 
     private func handleAudio(_ sampleBuffer: CMSampleBuffer, input: AVAssetWriterInput?) {
-        guard didStartSession, let input, input.isReadyForMoreMediaData else { return }
-        input.append(sampleBuffer)
+        guard !isPaused, didStartSession, let input, input.isReadyForMoreMediaData else { return }
+        guard let adjusted = retimed(sampleBuffer) else { return }
+        input.append(adjusted)
     }
 
-    private func ensureSessionStarted(with sampleBuffer: CMSampleBuffer) {
+    private func ensureSessionStarted(at pts: CMTime) {
         guard !didStartSession, let writer else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         writer.startWriting()
         writer.startSession(atSourceTime: pts)
         sessionStartPTS = pts
         didStartSession = true
+    }
+
+    private func currentPauseOffsetSeconds() -> Double {
+        if let start = pauseStartedHost {
+            return pausedSeconds + (CACurrentMediaTime() - start)
+        }
+        return pausedSeconds
+    }
+
+    private func retimed(_ sampleBuffer: CMSampleBuffer) -> CMSampleBuffer? {
+        let offset = currentPauseOffsetSeconds()
+        guard offset > 0.000_5 else { return sampleBuffer }
+        let original = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        var timing = CMSampleTimingInfo(
+            duration: CMSampleBufferGetDuration(sampleBuffer),
+            presentationTimeStamp: CMTimeSubtract(original, CMTime(seconds: offset, preferredTimescale: 600)),
+            decodeTimeStamp: .invalid
+        )
+        var output: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: sampleBuffer,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleBufferOut: &output
+        )
+        guard status == noErr else { return nil }
+        return output
     }
 }
 
@@ -298,25 +620,22 @@ extension ScreenRecorder: AVCaptureAudioDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        guard didStartSession, !isStopping, let micAudioInput, micAudioInput.isReadyForMoreMediaData else { return }
-        guard let retimed = retimedMicBuffer(sampleBuffer, sessionStart: sessionStartPTS) else { return }
-        micAudioInput.append(retimed)
+        meter.observe(sampleBuffer: sampleBuffer, isMicrophone: true)
+        guard !isPaused, didStartSession, !isStopping, let micAudioInput, micAudioInput.isReadyForMoreMediaData else { return }
+        guard let retimedMic = retimedMicBuffer(sampleBuffer, sessionStart: sessionStartPTS) else { return }
+        guard let adjusted = retimed(retimedMic) else { return }
+        micAudioInput.append(adjusted)
     }
 
-    /// Maps AVCapture mic timestamps onto the ScreenCaptureKit writer timeline.
     private func retimedMicBuffer(_ sampleBuffer: CMSampleBuffer, sessionStart: CMTime) -> CMSampleBuffer? {
         let originalPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        if micAnchorPTS == .invalid {
-            micAnchorPTS = originalPTS
-        }
-
+        if micAnchorPTS == .invalid { micAnchorPTS = originalPTS }
         let relative = CMTimeSubtract(originalPTS, micAnchorPTS)
         var timing = CMSampleTimingInfo(
             duration: CMSampleBufferGetDuration(sampleBuffer),
             presentationTimeStamp: CMTimeAdd(sessionStart, relative),
             decodeTimeStamp: .invalid
         )
-
         var output: CMSampleBuffer?
         let status = CMSampleBufferCreateCopyWithNewTiming(
             allocator: kCFAllocatorDefault,

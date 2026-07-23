@@ -5,10 +5,12 @@ struct CLI {
         case help
         case version
         case devices
+        case windows
+        case identify(seconds: Double)
         case record(RecordOptions)
     }
 
-    static let version = "1.0.0"
+    static let version = "1.2.0"
 
     static func parse(arguments: [String] = Array(CommandLine.arguments.dropFirst())) throws -> Command {
         if arguments.isEmpty { return .help }
@@ -23,15 +25,41 @@ struct CLI {
             return .version
         case "devices", "list":
             return .devices
+        case "windows":
+            return .windows
+        case "identify":
+            return .identify(seconds: try parseIdentifySeconds(args))
         case "record":
             return .record(try parseRecordOptions(args))
         default:
-            // Allow `screcord [options]` as shorthand for record
             if head.hasPrefix("-") {
                 return .record(try parseRecordOptions([head] + args))
             }
             throw ScrecordError.unsupported("Unknown command '\(head)'. Try: screcord help")
         }
+    }
+
+    private static func parseIdentifySeconds(_ args: [String]) throws -> Double {
+        var seconds = 3.0
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--seconds", "-t", "--duration":
+                i += 1
+                guard i < args.count, let value = Double(args[i]), value > 0 else {
+                    throw ScrecordError.unsupported("Invalid identify duration")
+                }
+                seconds = value
+            default:
+                if let value = Double(args[i]), value > 0 {
+                    seconds = value
+                } else {
+                    throw ScrecordError.unsupported("Unknown identify option '\(args[i])'")
+                }
+            }
+            i += 1
+        }
+        return seconds
     }
 
     private static func parseRecordOptions(_ args: [String]) throws -> RecordOptions {
@@ -51,21 +79,28 @@ struct CLI {
 
             switch arg {
             case "--display", "-d":
-                guard let value = Int(try needValue()) else {
-                    throw ScrecordError.unsupported("Invalid --display value")
-                }
-                options.displayIndex = value
+                options.displayQuery = try needValue()
             case "--region", "-r":
                 options.region = try Region.parse(try needValue())
+            case "--window", "-w":
+                options.windowQuery = try needValue()
+            case "--app":
+                options.appQuery = try needValue()
             case "--audio", "-a":
                 options.audioMode = try AudioMode.parse(try needValue())
+            case "--preset":
+                let preset = try RecordPreset.parse(try needValue())
+                options.preset = preset
+                preset.apply(to: &options)
             case "--no-cursor":
                 options.showCursor = false
             case "--cursor":
                 options.showCursor = true
+            case "--highlight-clicks":
+                options.highlightClicks = true
             case "--fps":
                 guard let fps = Int(try needValue()), (1...60).contains(fps) else {
-                    throw ScrecordError.invalidFPS(Int(args[min(index + 1, args.count - 1)]) ?? -1)
+                    throw ScrecordError.invalidFPS(-1)
                 }
                 options.fps = fps
             case "--bitrate", "--video-bitrate":
@@ -88,16 +123,35 @@ struct CLI {
                     throw ScrecordError.unsupported("Invalid --duration value")
                 }
                 options.duration = value
+            case "--idle-stop":
+                guard let value = Double(try needValue()), value > 0 else {
+                    throw ScrecordError.unsupported("Invalid --idle-stop value")
+                }
+                options.idleStop = value
             case "--output", "-o":
                 let path = try needValue()
                 options.outputURL = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            case "--slug":
+                options.slug = try needValue()
             case "--scale":
                 guard let value = Int(try needValue()), (1...3).contains(value) else {
                     throw ScrecordError.unsupported("Invalid --scale value (use 1, 2, or 3)")
                 }
                 options.scale = value
+            case "--exclude-self":
+                options.excludeSelf = true
+            case "--include-self":
+                options.excludeSelf = false
+            case "--meters":
+                options.meters = true
+            case "--no-meters":
+                options.meters = false
+            case "--webcam":
+                options.recordWebcam = true
+            case "--headless":
+                options.countdown = 0
+                options.meters = false
             case "--help", "-h":
-                // Handled by caller if needed; ignore inside record options
                 break
             default:
                 throw ScrecordError.unsupported("Unknown option '\(arg)'. Try: screcord help")
@@ -110,56 +164,62 @@ struct CLI {
     }
 
     static func printHelp() {
-        let text = """
-        screcord \(version) — reliable macOS screen recorder (ScreenCaptureKit)
+        print(
+            """
+            screcord \(version) — headless macOS screen recorder for tutorials & YouTube
 
-        USAGE:
-          screcord devices
-          screcord record [options]
-          screcord [options]              # same as record
+            USAGE:
+              screcord devices | windows | identify [--seconds 3]
+              screcord record [options]
+              screcord [options]
 
-        COMMANDS:
-          devices             List displays and microphones
-          record              Start a recording
-          help                Show this help
-          version             Show version
+            COMMANDS:
+              devices              List displays + mics (names + placement)
+              windows              List capturable windows/apps
+              identify             Flash big index badges on each display
+              record               Start recording
 
-        OPTIONS:
-          -d, --display <n>         Display index (default: 0)
-          -r, --region x,y,w,h      Capture region in points
-          -a, --audio <mode>        none | system | mic | both (default: both)
-              --no-cursor           Hide mouse cursor
-              --cursor              Show mouse cursor (default)
-              --fps <n>             Frame rate 1–60 (default: 30)
-              --bitrate <bps>       Video bitrate (default: 8000000)
-              --audio-bitrate <bps> AAC bitrate (default: 192000)
-          -c, --countdown <sec>     Countdown before start (default: 3)
-          -t, --duration <sec>      Auto-stop after N seconds
-          -o, --output <path>       Output .mp4 path (default: ~/Desktop/screcord-TIMESTAMP.mp4)
-              --scale <1|2|3>       Pixel scale factor (default: 2)
+            PRESETS:
+              --preset tutorial    30fps, system+mic, cursor on
+              --preset broll       high bitrate, system audio, no cursor
+              --preset clean-ui    system audio, no cursor
+              --preset motion      60fps silky UI B-roll
 
-        EXAMPLES:
-          screcord devices
-          screcord record
-          screcord record --audio system --no-cursor
-          screcord record --audio mic --countdown 5
-          screcord record --region 0,0,1280,720 --fps 60
-          screcord record --display 1 --duration 30 -o ~/Movies/demo.mp4
+            TARGET:
+              -d, --display <n|name|main>
+              -w, --window <title>           Single window capture
+                  --app <name|bundle>        Single app capture
+              -r, --region x,y,w,h
 
-        STOP:
-          Press Ctrl+C (or send SIGTERM) to finish and finalize the .mp4.
+            AUDIO / VIDEO:
+              -a, --audio none|system|mic|both
+                  --meters / --no-meters     Live loudness meters (default: on in TTY)
+                  --idle-stop <sec>          Auto-stop after silence
+                  --webcam                   Also record companion *-cam.mp4
+                  --highlight-clicks         Yellow click ripples (Accessibility)
+                  --no-cursor / --cursor
+                  --fps --bitrate --audio-bitrate --scale
 
-        PERMISSIONS:
-          System Settings → Privacy & Security → Screen & System Audio Recording
-          System Settings → Privacy & Security → Microphone  (for mic/both)
-          Grant access to your terminal app (Terminal, iTerm, Warp, etc.), then re-run.
+            SESSION:
+              -c, --countdown <sec>
+              -t, --duration <sec>
+                  --slug <name>              Desktop filename tag
+              -o, --output <path>
+                  --exclude-self             Hide terminal/screcord (default on)
+                  --include-self
+                  --headless                 countdown 0, meters off (agents)
 
-        NOTES:
-          • Output is H.264 + AAC in an .mp4 container (yuv420p / NV12 source).
-          • System audio uses ScreenCaptureKit — no BlackHole or loopback driver.
-          • On macOS 15+, microphone is captured natively by ScreenCaptureKit.
-          • On macOS 13–14, microphone uses AVFoundation as a fallback track.
-        """
-        print(text)
+            DURING RECORDING (TTY):
+              p  pause/resume     m  chapter marker     q / Ctrl+C  stop
+
+            EXAMPLES:
+              screcord identify
+              screcord record --preset tutorial --slug auth-flow
+              screcord record --preset broll --display main --duration 20
+              screcord record --window \"Notion\" --audio system --meters
+              screcord record --app Safari --preset clean-ui
+              screcord record --audio both --idle-stop 90 --slug talking-head
+            """
+        )
     }
 }

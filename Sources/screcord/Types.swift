@@ -32,6 +32,51 @@ enum AudioMode: String, CaseIterable {
     }
 }
 
+enum RecordPreset: String, CaseIterable {
+    case tutorial
+    case broll
+    case cleanUI = "clean-ui"
+    case motion
+
+    func apply(to options: inout RecordOptions) {
+        switch self {
+        case .tutorial:
+            options.audioMode = .both
+            options.showCursor = true
+            options.fps = 30
+            options.videoBitrate = 10_000_000
+            options.countdown = 3
+        case .broll:
+            options.audioMode = .system
+            options.showCursor = false
+            options.fps = 30
+            options.videoBitrate = 16_000_000
+            options.countdown = 0
+        case .cleanUI:
+            options.audioMode = .system
+            options.showCursor = false
+            options.fps = 30
+            options.videoBitrate = 12_000_000
+            options.countdown = 1
+        case .motion:
+            options.audioMode = .system
+            options.showCursor = true
+            options.fps = 60
+            options.videoBitrate = 20_000_000
+            options.countdown = 0
+        }
+    }
+
+    static func parse(_ raw: String) throws -> RecordPreset {
+        guard let preset = RecordPreset(rawValue: raw.lowercased()) else {
+            throw ScrecordError.unsupported(
+                "Invalid preset '\(raw)'. Use: tutorial, broll, clean-ui, motion"
+            )
+        }
+        return preset
+    }
+}
+
 struct Region: Equatable {
     var x: Double
     var y: Double
@@ -57,18 +102,36 @@ struct Region: Equatable {
     }
 }
 
+struct ChapterMarker: Codable, Sendable {
+    var seconds: Double
+    var label: String
+}
+
 struct RecordOptions {
-    var displayIndex: Int = 0
+    /// Display index or name (`main`, substring). Ignored when window/app capture is set.
+    var displayQuery: String = "0"
     var region: Region?
+    /// Substring or exact window title match.
+    var windowQuery: String?
+    /// Bundle id or app name substring.
+    var appQuery: String?
     var audioMode: AudioMode = .both
     var showCursor: Bool = true
+    var highlightClicks: Bool = false
     var fps: Int = 30
     var videoBitrate: Int = 8_000_000
     var audioBitrate: Int = 192_000
     var countdown: Int = 3
     var duration: Double?
+    /// Stop after this many seconds of near-silence (requires audio).
+    var idleStop: Double?
     var outputURL: URL?
+    var slug: String?
     var scale: Int = 2
+    var excludeSelf: Bool = true
+    var meters: Bool?
+    var recordWebcam: Bool = false
+    var preset: RecordPreset?
 }
 
 enum ScrecordError: LocalizedError {
@@ -104,12 +167,25 @@ enum ScrecordError: LocalizedError {
 }
 
 enum OutputPath {
-    static func defaultURL(on desktop: URL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Desktop")) -> URL {
+    static func defaultURL(
+        slug: String? = nil,
+        on desktop: URL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Desktop")
+    ) -> URL {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        let name = "screcord-\(formatter.string(from: Date())).mp4"
-        return desktop.appendingPathComponent(name)
+        let stamp = formatter.string(from: Date())
+        let slugPart: String
+        if let slug, !slug.isEmpty {
+            let cleaned = slug
+                .lowercased()
+                .replacingOccurrences(of: " ", with: "-")
+                .filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+            slugPart = cleaned.isEmpty ? "" : "-\(cleaned)"
+        } else {
+            slugPart = ""
+        }
+        return desktop.appendingPathComponent("screcord-\(stamp)\(slugPart).mp4")
     }
 }

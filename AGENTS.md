@@ -18,7 +18,9 @@ Agent entrypoint for this repository.
 ```bash
 make build
 screcord devices
-screcord record --countdown 0 --duration 5 --audio none -o /tmp/screcord-smoke.mp4
+screcord identify --seconds 2
+screcord record --preset broll --headless --duration 5 --slug smoke
+# Debug capture pipeline: SCRECORD_DEBUG=1 screcord record ...
 ```
 
 ## Non-negotiables

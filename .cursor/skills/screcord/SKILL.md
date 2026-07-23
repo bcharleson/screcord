@@ -1,100 +1,90 @@
 ---
 name: screcord
 description: >-
-  Record the macOS screen with screcord (ScreenCaptureKit CLI): list displays,
-  pick a screen/region, capture system audio and/or microphone, and save H.264
-  AAC MP4s. Use when the user asks to record the screen, capture a demo,
-  screencast, pick which display to record, or run screcord from an agent.
+  Record macOS screens for YouTube tutorials and B-roll with screcord: identify
+  displays, presets, window/app capture, live audio meters, pause/markers,
+  webcam companion files, and headless agent recordings. Use when recording
+  screen, screencast, tutorial capture, or running screcord.
 ---
 
-# screcord — record macOS screens
+# screcord — YouTube / tutorial capture
 
-Zero-dependency Swift CLI. Prefer this over ⌘⇧5 when betas break native recording.
+CLI-first, headless-friendly ScreenCaptureKit recorder. Prefer this over ⌘⇧5.
 
-## Binary resolution
-
-Try in order:
-
-1. `screcord` on `PATH`
-2. `$HOME/.local/bin/screcord`
-3. Repo build: `make build` then `.build/release/screcord`
+## Resolve binary
 
 ```bash
 command -v screcord || echo "$HOME/.local/bin/screcord"
+# or: make build && .build/release/screcord
 ```
 
-## Agent workflow
-
-Copy and track:
-
-```
-Recording:
-- [ ] 1. Resolve binary
-- [ ] 2. screcord devices  (pick display index)
-- [ ] 3. Confirm audio mode + output path
-- [ ] 4. Start record (--duration for unattended; else tell user Ctrl+C)
-- [ ] 5. Verify .mp4 exists and report path
-```
-
-### 1. List screens
+## Pick the right screen (don’t guess)
 
 ```bash
-screcord devices
+screcord devices          # names + left/right of main
+screcord identify         # flash big [0]/[1] badges on each monitor
+screcord record --display main
+screcord record --display "Studio Display"
 ```
 
-- Index `[0]` is the **main** display (`[main/default]`).
-- Match by resolution when the user says “the big monitor” / “laptop”.
-- If displays are empty → Screen Recording permission missing for the **terminal app that launched** screcord.
+## Presets (tutorials & B-roll)
 
-### 2. Start recording
-
-**Attended** (user stops with Ctrl+C):
+| Preset | Use for |
+|--------|---------|
+| `--preset tutorial` | Talking + screen, mic+system, cursor on |
+| `--preset broll` | Clean B-roll, system audio, no cursor, high bitrate |
+| `--preset clean-ui` | UI demos without pointer |
+| `--preset motion` | 60fps silky UI motion |
 
 ```bash
-screcord record --display 0 --audio both --countdown 3
+screcord record --preset tutorial --slug auth-flow
+screcord record --preset broll --display main --duration 20
 ```
 
-**Unattended / agent-driven** (always pass `--duration`):
+## Agent / headless workflow
+
+```
+- [ ] screcord devices / identify (if human present)
+- [ ] Choose preset + --slug
+- [ ] Unattended: --headless --duration N (required for agents)
+- [ ] Watch meters / probe output for silent failures
+- [ ] Report output path + probe summary
+```
 
 ```bash
-screcord record --display 0 --audio system --countdown 0 --duration 30 \
-  -o "$HOME/Desktop/screcord-demo.mp4"
+screcord record --preset broll --headless --duration 30 \
+  --display 0 --slug demo -o "$HOME/Desktop/demo.mp4"
 ```
 
-For long agent jobs, run in background and do not block the session forever without `--duration`.
+`Scripts/agent-record.sh` also works (requires `--duration`).
 
-### 3. Common recipes
+## Avoid silent takes
 
-| Goal | Command |
-|------|---------|
-| Main screen, system+mic | `screcord record` |
-| System audio only, no cursor | `screcord record --audio system --no-cursor` |
-| Mic only | `screcord record --audio mic` |
-| Second display, 30s | `screcord record --display 1 --duration 30` |
-| Region | `screcord record --region 0,0,1280,720` |
-| Silent video smoke test | `screcord record --audio none --countdown 0 --duration 3 -o /tmp/screcord-smoke.mp4` |
+- Live meters on TTY by default: `♪ sys:… mic:…`
+- `--meters` / `--no-meters`
+- `--idle-stop 90` auto-stops after silence
+- Post-record **Probe** prints duration/resolution/audio presence
 
-### 4. Stop / output
+## Window / app capture
 
-- Stop: **Ctrl+C** or SIGTERM (finalizes MP4). Do not `kill -9`.
-- Default output: `~/Desktop/screcord-YYYY-MM-DD-HHmmss.mp4`
-- After recording, print the absolute path and file size.
+```bash
+screcord windows
+screcord record --window "Notion" --preset clean-ui
+screcord record --app Safari --audio system
+```
 
-## Permissions
+## During attended recording (TTY)
 
-If capture fails or device list is empty:
+- `p` pause/resume (jump-cut, paused time removed)
+- `m` chapter marker → `*.chapters.json` + YouTube timestamps
+- `q` / Ctrl+C stop
 
-1. System Settings → Privacy & Security → **Screen & System Audio Recording** → enable the terminal/IDE
-2. **Microphone** → same app (for `mic` / `both`)
-3. Quit and relaunch that app, retry
+## Extra
 
-## Decision rules
+- `--webcam` → companion `*-cam.mp4` for PIP in the editor (not burned in)
+- `--highlight-clicks` (needs Accessibility)
+- `--exclude-self` default on (hides terminal/Cursor from display capture)
 
-- User did not specify display → use `--display 0` (main), mention it.
-- User wants a quick clip and will not babysit → require `--duration`.
-- User wants voiceover → `--audio both` or `mic`.
-- Avoid interactive countdown in CI/agent loops → `--countdown 0`.
+## Reference
 
-## More detail
-
-- Full CLI flags: [reference.md](reference.md)
+- Flags: [reference.md](reference.md)
