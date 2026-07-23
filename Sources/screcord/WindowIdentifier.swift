@@ -12,10 +12,20 @@ struct CapturableWindow: Sendable {
 }
 
 enum WindowCatalog {
+    private static let ignoredTitleFragments = [
+        "backstop", "menubar", "statusindicator", "underbelly", "fullscreen wallpaper"
+    ]
+
     static func list(from content: SCShareableContent, filter: String? = nil) -> [CapturableWindow] {
         let query = filter?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let windows = content.windows
-            .filter { ($0.title?.isEmpty == false) }
+            .filter { window in
+                guard let title = window.title, !title.isEmpty else { return false }
+                guard let app = window.owningApplication, !app.applicationName.isEmpty else { return false }
+                let lowered = title.lowercased()
+                if ignoredTitleFragments.contains(where: { lowered.contains($0) }) { return false }
+                return true
+            }
             .filter { window in
                 guard let query, !query.isEmpty else { return true }
                 let title = (window.title ?? "").lowercased()

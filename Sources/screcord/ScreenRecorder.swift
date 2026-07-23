@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreMedia
 import CoreVideo
@@ -81,6 +82,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     func start() async throws {
         if options.audioMode.capturesMicrophone {
             try await Permissions.ensureMicrophoneAccess()
+        }
+
+        // Window capture touches CGS window server APIs; bootstrap AppKit/CG first.
+        if options.windowQuery != nil {
+            await MainActor.run {
+                let app = NSApplication.shared
+                app.setActivationPolicy(.accessory)
+                _ = CGMainDisplayID()
+            }
         }
 
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
