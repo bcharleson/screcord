@@ -105,7 +105,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     healthy = false
                 }
                 // After frames should be flowing, stall = dead take.
-                if lastSuccessfulAppendHost > 0, sinceAppend > 12 {
+                // 25s threshold: brief encoder backpressure shouldn't nuke a take.
+                if lastSuccessfulAppendHost > 0, sinceAppend > 25 {
                     healthy = false
                 }
             }
@@ -382,7 +383,11 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             config.width = max(2, Int(rect.width) * scale)
             config.height = max(2, Int(rect.height) * scale)
         } else {
-            let maxWidth = 3840
+            // Cap long-form encodes at 1920px wide by default. Full 4K@30 with dual AAC
+            // was stalling AVAssetWriter mid-take (frames freeze, silent death).
+            // Override with SCRECORD_MAX_WIDTH=3840 for true 4K when you need it.
+            let envMax = ProcessInfo.processInfo.environment["SCRECORD_MAX_WIDTH"].flatMap(Int.init)
+            let maxWidth = envMax ?? 1920
             let targetWidth = min(Int(contentSize.width) * scale, maxWidth)
             let targetHeight = Int(
                 (Double(targetWidth) * contentSize.height / max(contentSize.width, 1)).rounded()
