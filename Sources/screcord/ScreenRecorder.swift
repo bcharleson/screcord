@@ -9,7 +9,7 @@ import ScreenCaptureKit
 
 final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let options: RecordOptions
-    private let outputURL: URL
+    private var outputURL: URL
     let meter: AudioMeter
 
     private var stream: SCStream?
@@ -22,6 +22,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private let sampleQueue = DispatchQueue(label: "com.screcord.samples")
     private var didStartSession = false
     private var isStopping = false
+    private var isRotating = false
     private var sessionStartPTS: CMTime = .invalid
     private var lastWrittenPTS: CMTime = .invalid
 
@@ -44,6 +45,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var debugStatusHistogram: [String: Int] = [:]
     private let debugEnabled = ProcessInfo.processInfo.environment["SCRECORD_DEBUG"] == "1"
 
+    // Health — the entire point of this tool surviving long takes.
+    private var failureReason: String?
+    private var lastSuccessfulAppendHost: CFTimeInterval = 0
+    private var consecutiveAppendFailures = 0
+    private var writerFailedNotified = false
+    /// Wall-clock seconds of media successfully appended in the current part.
+    private var partTimelineSeconds: Double = 0
+
     init(options: RecordOptions, outputURL: URL, meter: AudioMeter) {
         self.options = options
         self.outputURL = outputURL
@@ -57,8 +66,74 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     var timelineSeconds: Double {
         sampleQueue.sync {
-            guard sessionStartPTS.isValid, lastWrittenPTS.isValid else { return 0 }
+            guard sessionStartPTS.isValid, lastWrittenPTS.isValid else { return partTimelineSeconds }
             return CMTimeGetSeconds(CMTimeSubtract(lastWrittenPTS, sessionStartPTS))
+        }
+    }
+
+    var currentOutputURL: URL {
+        sampleQueue.sync { outputURL }
+    }
+
+    func health() -> RecorderHealth {
+        sampleQueue.sync {
+            let now = CACurrentMediaTime()
+            let sinceAppend: Double
+            if lastSuccessfulAppendHost > 0 {
+                sinceAppend = now - lastSuccessfulAppendHost
+            } else {
+                sinceAppend = didStartSession ? now : 0
+            }
+            let bytes = (try? FileManager.default.attributesOfItem(atPath: outputURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+            let status: String
+            if let writer {
+                switch writer.status {
+                case .unknown: status = "unknown"
+                case .writing: status = "writing"
+                case .completed: status = "completed"
+                case .failed: status = "failed"
+                case .cancelled: status = "cancelled"
+                @unknown default: status = "other"
+                }
+            } else {
+                status = "nil"
+            }
+
+            var healthy = failureReason == nil
+            if didStartSession, !isPaused, !isStopping, !isRotating {
+                if let writer, writer.status == .failed {
+                    healthy = false
+                }
+                // After frames should be flowing, stall = dead take.
+                if lastSuccessfulAppendHost > 0, sinceAppend > 12 {
+                    healthy = false
+                }
+            }
+
+            let reason: String?
+            if let failureReason {
+                reason = failureReason
+            } else if !healthy {
+                reason = "no successful frame append for \(String(format: "%.1f", sinceAppend))s"
+            } else {
+                reason = nil
+            }
+
+            return RecorderHealth(
+                isHealthy: healthy,
+                isPaused: isPaused,
+                didStart: didStartSession,
+                timelineSeconds: {
+                    guard sessionStartPTS.isValid, lastWrittenPTS.isValid else { return 0 }
+                    return CMTimeGetSeconds(CMTimeSubtract(lastWrittenPTS, sessionStartPTS))
+                }(),
+                framesAppended: debugAppendCount,
+                fileBytes: bytes,
+                secondsSinceLastAppend: sinceAppend,
+                writerStatus: status,
+                failureReason: reason,
+                outputPath: outputURL.path
+            )
         }
     }
 
@@ -121,7 +196,68 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         try await stream.startCapture()
     }
 
-    func stop() async throws -> URL {
+    /// Finish the current part and open a new writer on `newURL` without stopping capture.
+    func rotateSegment(to newURL: URL) async throws -> StopResult {
+        // Seal current writer on the sample queue.
+        let closedURL: URL = await withCheckedContinuation { cont in
+            sampleQueue.async {
+                self.isRotating = true
+                cont.resume(returning: self.outputURL)
+            }
+        }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            sampleQueue.async {
+                self.videoInput?.markAsFinished()
+                self.systemAudioInput?.markAsFinished()
+                self.micAudioInput?.markAsFinished()
+                continuation.resume()
+            }
+        }
+
+        var salvage: String?
+        if let writer {
+            if writer.status == .writing {
+                await writer.finishWriting()
+            }
+            if writer.status == .failed {
+                salvage = writer.error?.localizedDescription ?? "writer failed during segment rotate"
+            }
+        }
+
+        // Reset session state and open next part.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            sampleQueue.async {
+                do {
+                    self.writer = nil
+                    self.videoInput = nil
+                    self.videoAdaptor = nil
+                    self.systemAudioInput = nil
+                    self.micAudioInput = nil
+                    self.didStartSession = false
+                    self.sessionStartPTS = .invalid
+                    self.lastWrittenPTS = .invalid
+                    self.partTimelineSeconds = 0
+                    self.lastSuccessfulAppendHost = 0
+                    self.consecutiveAppendFailures = 0
+                    self.failureReason = nil
+                    self.writerFailedNotified = false
+                    self.micAnchorPTS = .invalid
+                    self.outputURL = newURL
+                    try self.prepareWriter(width: self.outputWidth, height: self.outputHeight)
+                    self.isRotating = false
+                    continuation.resume()
+                } catch {
+                    self.isRotating = false
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+
+        return StopResult(url: closedURL, salvageWarning: salvage)
+    }
+
+    func stop() async throws -> StopResult {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             sampleQueue.async {
                 self.isStopping = true
@@ -151,22 +287,28 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
 
         guard let writer else {
+            if FileManager.default.fileExists(atPath: outputURL.path) {
+                return StopResult(url: outputURL, salvageWarning: "Writer was never created; file may be incomplete.")
+            }
             throw ScrecordError.writerFailed("Writer was never created.")
         }
 
+        var salvage: String?
         if writer.status == .writing {
             await writer.finishWriting()
         }
-
         if writer.status == .failed {
-            throw ScrecordError.writerFailed(writer.error?.localizedDescription ?? "unknown writer error")
+            salvage = writer.error?.localizedDescription
+                ?? failureReason
+                ?? "unknown writer error"
         }
 
         guard FileManager.default.fileExists(atPath: outputURL.path) else {
-            throw ScrecordError.writerFailed("Output file was not created. Did any frames arrive?")
+            throw ScrecordError.writerFailed(salvage ?? "Output file was not created. Did any frames arrive?")
         }
 
-        return outputURL
+        // NEVER throw away a partial take — return it with a warning.
+        return StopResult(url: outputURL, salvageWarning: salvage)
     }
 
     // MARK: - Filter
@@ -230,8 +372,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    // MARK: - Configuration
-
     private func makeStreamConfiguration(contentSize: CGSize) throws -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         let scale = max(1, options.scale)
@@ -276,8 +416,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        // Fragmented MP4: flush the index every 5s so a crash, kill, or failed
-        // finalize loses at most the last fragment instead of the whole take.
+        // Fragmented MP4: flush every 5s so crash/kill loses at most one fragment.
         writer.movieFragmentInterval = CMTime(seconds: 5, preferredTimescale: 600)
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -294,7 +433,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         guard writer.canAdd(videoInput) else { throw ScrecordError.writerFailed("Cannot add video input.") }
         writer.add(videoInput)
         self.videoInput = videoInput
-        // Pixel-buffer adaptor + copy avoids ScreenCaptureKit recycling buffers mid-encode.
         self.videoAdaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: videoInput,
             sourcePixelBufferAttributes: [
@@ -362,7 +500,17 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     // MARK: - Samples
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard CMSampleBufferDataIsReady(sampleBuffer), !isStopping else { return }
+        guard CMSampleBufferDataIsReady(sampleBuffer), !isStopping, !isRotating else { return }
+
+        // Hard stop appending if writer already dead.
+        if let failureReason {
+            _ = failureReason
+            return
+        }
+        if let writer, writer.status == .failed {
+            markWriterFailed(writer.error?.localizedDescription ?? "AVAssetWriter status=failed")
+            return
+        }
 
         switch type {
         case .screen:
@@ -379,7 +527,18 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        FileHandle.standardError.write(Data("Stream stopped with error: \(error.localizedDescription)\n".utf8))
+        markWriterFailed("Stream stopped: \(error.localizedDescription)")
+        FileHandle.standardError.write(Data("\n🚨 Stream stopped with error: \(error.localizedDescription)\n".utf8))
+    }
+
+    private func markWriterFailed(_ reason: String) {
+        guard failureReason == nil else { return }
+        failureReason = reason
+        if !writerFailedNotified {
+            writerFailedNotified = true
+            fputs("\n🚨 WRITER DEAD — \(reason)\n", stderr)
+            fputs("🚨 Stopping so earlier session parts stay safe. Check session folder.\n", stderr)
+        }
     }
 
     private func handleVideo(_ sampleBuffer: CMSampleBuffer) {
@@ -407,7 +566,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 append(pixelBuffer: cloned, pts: pts)
             }
         case .idle:
-            // Static UI: SCK emits idle without a new surface — repeat last frame.
             if let lastPixelBuffer {
                 append(pixelBuffer: lastPixelBuffer, pts: pts)
             }
@@ -450,7 +608,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
 
         if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-            // Prefer any buffer that still has pixels.
             if let statusRaw, let status = SCFrameStatus(rawValue: statusRaw), status != .complete, status != .idle {
                 return .drop
             }
@@ -460,7 +617,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         if let statusRaw, let status = SCFrameStatus(rawValue: statusRaw), status == .idle {
             return .idle
         }
-        // rawValue 1 is idle on current SDKs even when enum bridging is odd.
         if statusRaw == 1 {
             return .idle
         }
@@ -470,6 +626,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private func append(pixelBuffer: CVPixelBuffer, pts: CMTime) {
         ensureSessionStarted(at: pts)
         guard let videoInput, let videoAdaptor else { return }
+        guard let writer, writer.status == .writing || writer.status == .unknown else {
+            markWriterFailed("writer not writable (status=\(writer?.status.rawValue ?? -1))")
+            return
+        }
         guard videoInput.isReadyForMoreMediaData else {
             debugDropNotReady += 1
             return
@@ -477,12 +637,19 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         if videoAdaptor.append(pixelBuffer, withPresentationTime: pts) {
             debugAppendCount += 1
             lastWrittenPTS = pts
-        } else if debugEnabled, debugFrameCount <= 8 {
-            let err = writer?.error?.localizedDescription ?? "nil"
-            fputs(
-                "debug append fail #\(debugFrameCount) pts=\(CMTimeGetSeconds(pts)) err=\(err)\n",
-                stderr
-            )
+            lastSuccessfulAppendHost = CACurrentMediaTime()
+            consecutiveAppendFailures = 0
+            if sessionStartPTS.isValid {
+                partTimelineSeconds = CMTimeGetSeconds(CMTimeSubtract(pts, sessionStartPTS))
+            }
+        } else {
+            consecutiveAppendFailures += 1
+            let err = writer.error?.localizedDescription ?? "append returned false"
+            if writer.status == .failed || consecutiveAppendFailures >= 45 {
+                markWriterFailed(err)
+            } else if debugEnabled {
+                fputs("debug append fail #\(debugFrameCount) pts=\(CMTimeGetSeconds(pts)) err=\(err)\n", stderr)
+            }
         }
     }
 
@@ -539,48 +706,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         "frames=\(debugFrameCount) complete=\(debugCompleteCount) appended=\(debugAppendCount) notReady=\(debugDropNotReady) statuses=\(debugStatusHistogram) writer=\(writer?.status.rawValue ?? -1)"
     }
 
-    private func isCompleteVideoFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
-        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-              let attachments = attachmentsArray.first
-        else {
-            debugStatusHistogram["no-attachments", default: 0] += 1
-            return true
-        }
-
-        let statusRaw: Int?
-        if let value = attachments[.status] as? Int {
-            statusRaw = value
-        } else if let number = attachments[.status] as? NSNumber {
-            statusRaw = number.intValue
-        } else if let value = attachments[SCStreamFrameInfo.status] as? Int {
-            statusRaw = value
-        } else {
-            statusRaw = nil
-        }
-
-        guard let statusRaw else {
-            debugStatusHistogram["nil-status", default: 0] += 1
-            return true
-        }
-        guard let status = SCFrameStatus(rawValue: statusRaw) else {
-            debugStatusHistogram["unknown-\(statusRaw)", default: 0] += 1
-            return statusRaw == 0 // be permissive
-        }
-        debugStatusHistogram["\(status)", default: 0] += 1
-        // `idle` = screen unchanged but buffer still valid — required for static tutorial UIs.
-        // Skipping idle produces tiny files whenever nothing is animating.
-        switch status {
-        case .complete, .idle:
-            return CMSampleBufferGetImageBuffer(sampleBuffer) != nil
-        default:
-            return false
-        }
-    }
-
     private func handleAudio(_ sampleBuffer: CMSampleBuffer, input: AVAssetWriterInput?) {
         guard !isPaused, didStartSession, let input, input.isReadyForMoreMediaData else { return }
+        guard let writer, writer.status == .writing || writer.status == .unknown else { return }
         guard let adjusted = retimed(sampleBuffer) else { return }
-        input.append(adjusted)
+        if !input.append(adjusted) {
+            if writer.status == .failed {
+                markWriterFailed(writer.error?.localizedDescription ?? "audio append failed")
+            }
+        }
     }
 
     private func ensureSessionStarted(at pts: CMTime) {
@@ -589,6 +723,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         writer.startSession(atSourceTime: pts)
         sessionStartPTS = pts
         didStartSession = true
+        lastSuccessfulAppendHost = CACurrentMediaTime()
     }
 
     private func currentPauseOffsetSeconds() -> Double {
@@ -627,7 +762,7 @@ extension ScreenRecorder: AVCaptureAudioDataOutputSampleBufferDelegate {
         from connection: AVCaptureConnection
     ) {
         meter.observe(sampleBuffer: sampleBuffer, isMicrophone: true)
-        guard !isPaused, didStartSession, !isStopping, let micAudioInput, micAudioInput.isReadyForMoreMediaData else { return }
+        guard !isPaused, didStartSession, !isStopping, !isRotating, let micAudioInput, micAudioInput.isReadyForMoreMediaData else { return }
         guard let retimedMic = retimedMicBuffer(sampleBuffer, sessionStart: sessionStartPTS) else { return }
         guard let adjusted = retimed(retimedMic) else { return }
         micAudioInput.append(adjusted)

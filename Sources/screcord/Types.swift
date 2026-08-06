@@ -125,6 +125,7 @@ struct RecordOptions {
     var duration: Double?
     /// Stop after this many seconds of near-silence (requires audio).
     var idleStop: Double?
+    /// Optional single-file path. When set, session lives in `<stem>.session/` beside it.
     var outputURL: URL?
     var slug: String?
     var scale: Int = 2
@@ -132,6 +133,49 @@ struct RecordOptions {
     var meters: Bool?
     var recordWebcam: Bool = false
     var preset: RecordPreset?
+    /// Roll a new part file every N minutes. Default 5 — max loss on writer death is one segment.
+    /// Set 0 only if you accept single-file risk (`--no-segment`).
+    var segmentMinutes: Double = 5
+}
+
+/// Snapshot used by the live watchdog so silent writer death is impossible.
+struct RecorderHealth: Sendable {
+    var isHealthy: Bool
+    var isPaused: Bool
+    var didStart: Bool
+    var timelineSeconds: Double
+    var framesAppended: Int
+    var fileBytes: Int64
+    var secondsSinceLastAppend: Double
+    var writerStatus: String
+    var failureReason: String?
+    var outputPath: String
+}
+
+struct StopResult: Sendable {
+    var url: URL
+    /// Non-nil when the file was salvaged after a writer/finalize failure.
+    var salvageWarning: String?
+}
+
+struct SessionManifest: Codable {
+    var version: Int
+    var startedAt: String
+    var slug: String?
+    var sessionDir: String
+    var segmentMinutes: Double
+    var parts: [SessionPart]
+    var status: String
+    var lastHeartbeatAt: String?
+    var failureReason: String?
+}
+
+struct SessionPart: Codable {
+    var index: Int
+    var path: String
+    var bytes: Int64?
+    var closedAt: String?
+    var salvage: Bool
 }
 
 enum ScrecordError: LocalizedError {
@@ -167,25 +211,59 @@ enum ScrecordError: LocalizedError {
 }
 
 enum OutputPath {
+    static let sessionsRoot: URL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Desktop")
+        .appendingPathComponent("screcord-sessions")
+
+    static func cleanSlug(_ slug: String?) -> String {
+        guard let slug, !slug.isEmpty else { return "" }
+        let cleaned = slug
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+            .filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        return cleaned
+    }
+
+    static func timestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return formatter.string(from: Date())
+    }
+
+    /// Crash-safe session folder. Always used — parts land here, never one fragile file.
+    ///
+    /// - No `-o`: `~/Desktop/screcord-sessions/<stamp>[-slug]/`
+    /// - With `-o foo.mp4`: `foo.session/` beside the requested path
+    static func sessionDirectory(options: RecordOptions) -> URL {
+        if let output = options.outputURL {
+            let parent = output.deletingLastPathComponent()
+            let stem = output.deletingPathExtension().lastPathComponent
+            return parent.appendingPathComponent("\(stem).session")
+        }
+        let stamp = timestamp()
+        let slug = cleanSlug(options.slug)
+        let name = slug.isEmpty ? stamp : "\(stamp)-\(slug)"
+        return sessionsRoot.appendingPathComponent(name)
+    }
+
+    static func partURL(sessionDir: URL, index: Int) -> URL {
+        sessionDir.appendingPathComponent(String(format: "part-%02d.mp4", index))
+    }
+
+    static func manifestURL(sessionDir: URL) -> URL {
+        sessionDir.appendingPathComponent("session.json")
+    }
+
+    /// Legacy single-file default (kept for tests/compat). Prefer sessionDirectory.
     static func defaultURL(
         slug: String? = nil,
         on desktop: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Desktop")
     ) -> URL {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        let stamp = formatter.string(from: Date())
-        let slugPart: String
-        if let slug, !slug.isEmpty {
-            let cleaned = slug
-                .lowercased()
-                .replacingOccurrences(of: " ", with: "-")
-                .filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
-            slugPart = cleaned.isEmpty ? "" : "-\(cleaned)"
-        } else {
-            slugPart = ""
-        }
+        let stamp = timestamp()
+        let cleaned = cleanSlug(slug)
+        let slugPart = cleaned.isEmpty ? "" : "-\(cleaned)"
         return desktop.appendingPathComponent("screcord-\(stamp)\(slugPart).mp4")
     }
 }

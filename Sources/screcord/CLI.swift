@@ -11,7 +11,7 @@ struct CLI {
         case record(RecordOptions)
     }
 
-    static let version = "1.2.1"
+    static let version = "1.3.0"
 
     static func parse(arguments: [String] = Array(CommandLine.arguments.dropFirst())) throws -> Command {
         if arguments.isEmpty { return .help }
@@ -178,6 +178,13 @@ struct CLI {
                 options.meters = false
             case "--webcam":
                 options.recordWebcam = true
+            case "--segment-minutes":
+                guard let value = Double(try needValue()), value >= 0 else {
+                    throw ScrecordError.unsupported("Invalid --segment-minutes value")
+                }
+                options.segmentMinutes = value
+            case "--no-segment":
+                options.segmentMinutes = 0
             case "--headless":
                 options.countdown = 0
                 options.meters = false
@@ -233,27 +240,33 @@ struct CLI {
                   --no-cursor / --cursor
                   --fps --bitrate --audio-bitrate --scale
 
-            SESSION:
+            SESSION (crash-safe by default):
               -c, --countdown <sec>
               -t, --duration <sec>
-                  --slug <name>              Desktop filename tag
-              -o, --output <path>
+                  --slug <name>              session folder tag
+              -o, --output <path>            writes to <stem>.session/ parts
+                  --segment-minutes <n>      seal a new part every n min (default 5)
+                  --no-segment               single file (NOT recommended for long takes)
                   --exclude-self             Hide terminal/screcord (default on)
                   --include-self
                   --headless                 countdown 0, meters off (agents)
 
+            SAFETY:
+              Every take is a SESSION FOLDER of part-01.mp4, part-02.mp4, …
+              Default roll every 5 minutes — writer death loses at most one part.
+              Live heartbeat + watchdog abort if frames/file stop growing.
+              session.json tracks parts so nothing is a mystery later.
+
             DURING RECORDING (TTY):
               p  pause/resume     m  chapter marker     q / Ctrl+C  stop
+              ♥ heartbeat every 5s on stderr (duration · MB · frames · OK/DEAD)
 
             EXAMPLES:
               screcord identify
-              screcord identify-windows --filter \"Chrome\"
-              screcord windows
-              screcord record --display main
-              screcord record --window 3
-              screcord record --window \"Notion\" --preset clean-ui
-              screcord record --preset tutorial --slug auth-flow
+              screcord record --preset tutorial --slug fde-101 --display \"K3-1\"
+              screcord record --preset tutorial --display \"K3-1\" --bitrate 12000000
               screcord record --preset broll --display main --duration 20
+              screcord record --segment-minutes 3 --slug long-take
             """
         )
     }

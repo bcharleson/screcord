@@ -30,11 +30,14 @@ enum ScrecordApp {
     }
 
     private static func runRecording(_ options: RecordOptions) async throws {
-        let outputURL = options.outputURL ?? OutputPath.defaultURL(slug: options.slug)
-        try FileManager.default.createDirectory(
-            at: outputURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        // Always record into a session folder of sealed part files.
+        let sessionDir = OutputPath.sessionDirectory(options: options)
+        let session = try SessionStore(
+            sessionDir: sessionDir,
+            segmentMinutes: options.segmentMinutes,
+            slug: options.slug
         )
+        let firstPart = session.currentPartURL
 
         let metersEnabled = options.meters ?? (isatty(STDERR_FILENO) != 0)
         let meter = AudioMeter(enabled: metersEnabled)
@@ -47,7 +50,13 @@ enum ScrecordApp {
         print("Cursor:   \(options.showCursor ? "on" : "off")\(options.highlightClicks ? " + click highlights" : "")")
         print("FPS:      \(options.fps)")
         print("Meters:   \(metersEnabled ? "on" : "off")")
-        print("Output:   \(outputURL.path)")
+        if options.segmentMinutes > 0 {
+            print("Segments: every \(formatMinutes(options.segmentMinutes)) (crash-safe)")
+        } else {
+            print("Segments: OFF ⚠ single-file risk")
+        }
+        print("Session:  \(sessionDir.path)")
+        print("Part:     \(firstPart.path)")
         print("")
 
         if options.countdown > 0 {
@@ -57,7 +66,7 @@ enum ScrecordApp {
             }
         }
 
-        let recorder = ScreenRecorder(options: options, outputURL: outputURL, meter: meter)
+        let recorder = ScreenRecorder(options: options, outputURL: firstPart, meter: meter)
         try await recorder.start()
         print("Target:   \(recorder.resolvedTargetDescription)")
         print("Size:     \(recorder.outputWidth)x\(recorder.outputHeight)")
@@ -65,10 +74,7 @@ enum ScrecordApp {
         var webcam: WebcamRecorder?
         if options.recordWebcam {
             try await Permissions.ensureCameraAccess()
-            let base = outputURL.deletingPathExtension().lastPathComponent
-            let companion = outputURL
-                .deletingLastPathComponent()
-                .appendingPathComponent("\(base)-cam.mp4")
+            let companion = sessionDir.appendingPathComponent("webcam.mp4")
             let cam = WebcamRecorder(outputURL: companion)
             try cam.start()
             webcam = cam
@@ -82,6 +88,7 @@ enum ScrecordApp {
 
         meter.start()
         print("Recording…")
+        print("Watchdog: fail-loud if writer dies · heartbeat every 5s · parts sealed on roll")
 
         let stopSignal = StopSignal.shared
         stopSignal.install()
@@ -104,7 +111,10 @@ enum ScrecordApp {
             duration: options.duration,
             idleStop: options.idleStop,
             meter: meter,
-            audioEnabled: options.audioMode != .none
+            audioEnabled: options.audioMode != .none,
+            recorder: recorder,
+            session: session,
+            segmentMinutes: options.segmentMinutes
         )
 
         controls.stop()
@@ -121,13 +131,40 @@ enum ScrecordApp {
             fputs("debug: \(recorder.debugSummary())\n", stderr)
         }
 
-        let url = try await recorder.stop()
+        let result = try await recorder.stop()
+        try session.markPartClosed(url: result.url, salvage: result.salvageWarning != nil)
+        if let warning = result.salvageWarning {
+            fputs("\n⚠ salvaged current part after writer error: \(warning)\n", stderr)
+            fputs("⚠ earlier sealed parts in the session folder are still good.\n", stderr)
+            session.markFailed(warning)
+        } else {
+            session.markCompleted()
+        }
+
         if let webcam, let camURL = try await webcam.stop() {
             print("Webcam saved → \(camURL.path)")
         }
 
-        try MarkerStore.writeSidecar(for: url, markers: markers)
-        await RecordingProbe.printReport(for: url)
+        try MarkerStore.writeSidecar(for: result.url, markers: markers)
+        session.printSummary()
+
+        // Probe every sealed part + current.
+        let listed = (try? FileManager.default.contentsOfDirectory(
+            at: sessionDir,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        let partFiles = listed
+            .filter { $0.pathExtension.lowercased() == "mp4" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let toProbe = partFiles.isEmpty ? [result.url] : partFiles
+        for part in toProbe {
+            await RecordingProbe.printReport(for: part)
+        }
+
+        if result.salvageWarning != nil {
+            // Non-zero so scripts know, but files are on disk.
+            exit(2)
+        }
     }
 
     /// ScreenCaptureKit needs the main run loop serviced while recording.
@@ -136,10 +173,22 @@ enum ScrecordApp {
         duration: Double?,
         idleStop: Double?,
         meter: AudioMeter,
-        audioEnabled: Bool
+        audioEnabled: Bool,
+        recorder: ScreenRecorder,
+        session: SessionStore,
+        segmentMinutes: Double
     ) async {
         let startedAt = Date()
         var nextMeterLog = Date().addingTimeInterval(1)
+        var nextHeartbeat = Date().addingTimeInterval(5)
+        var nextHealthCheck = Date().addingTimeInterval(2)
+        var nextSegmentAt: Date? = segmentMinutes > 0
+            ? Date().addingTimeInterval(segmentMinutes * 60)
+            : nil
+        var framesAtLastGrowth = 0
+        var bytesAtLastGrowth: Int64 = 0
+        var lastGrowthAt = Date()
+        var sawFirstFrames = false
 
         while !stopSignal.isStopped {
             if let duration, Date().timeIntervalSince(startedAt) >= duration {
@@ -154,6 +203,99 @@ enum ScrecordApp {
                 }
             }
 
+            // --- Segment roll: seal part-N, open part-N+1 ---
+            if let due = nextSegmentAt, Date() >= due, !stopSignal.isStopped {
+                do {
+                    fputs("\n⏭ sealing segment → rolling new part…\n", stderr)
+                    let nextURL = try session.beginNextPart()
+                    let closed = try await recorder.rotateSegment(to: nextURL)
+                    try session.markPartClosed(url: closed.url, salvage: closed.salvageWarning != nil)
+                    if let w = closed.salvageWarning {
+                        fputs("⚠ previous part salvaged: \(w)\n", stderr)
+                    }
+                    let bytes = (try? FileManager.default.attributesOfItem(atPath: closed.url.path)[.size] as? NSNumber)?.int64Value ?? 0
+                    let mb = Double(bytes) / 1_048_576.0
+                    fputs(
+                        "✓ sealed \(closed.url.lastPathComponent) (\(String(format: "%.1f", mb)) MB) · now writing \(nextURL.lastPathComponent)\n",
+                        stderr
+                    )
+                    nextSegmentAt = Date().addingTimeInterval(segmentMinutes * 60)
+                    framesAtLastGrowth = 0
+                    bytesAtLastGrowth = 0
+                    lastGrowthAt = Date()
+                    sawFirstFrames = false
+                } catch {
+                    fputs("\n🚨 segment roll failed: \(error.localizedDescription)\n", stderr)
+                    stopSignal.requestStop(reason: "segment roll failed")
+                    break
+                }
+            }
+
+            // --- Health watchdog: never sit silent while writer is dead ---
+            if Date() >= nextHealthCheck {
+                let health = recorder.health()
+                session.heartbeat(
+                    fileBytes: health.fileBytes,
+                    timelineSeconds: health.timelineSeconds,
+                    writerOK: health.isHealthy
+                )
+
+                if health.didStart, health.framesAppended > 0 {
+                    sawFirstFrames = true
+                }
+
+                if health.framesAppended > framesAtLastGrowth || health.fileBytes > bytesAtLastGrowth {
+                    framesAtLastGrowth = health.framesAppended
+                    bytesAtLastGrowth = health.fileBytes
+                    lastGrowthAt = Date()
+                }
+
+                if !health.isHealthy, sawFirstFrames, !health.isPaused {
+                    let reason = health.failureReason ?? "writer unhealthy"
+                    fputs("\n🚨 WATCHDOG: \(reason)\n", stderr)
+                    fputs("🚨 Aborting NOW — sealed session parts are kept.\n", stderr)
+                    session.markFailed(reason)
+                    stopSignal.requestStop(reason: "writer failure")
+                    break
+                }
+
+                // File not growing for too long after frames should flow.
+                if sawFirstFrames, !health.isPaused,
+                   Date().timeIntervalSince(lastGrowthAt) > 20,
+                   Date().timeIntervalSince(startedAt) > 15
+                {
+                    let reason = "file/frames not growing for 20s (writer may be stuck)"
+                    fputs("\n🚨 WATCHDOG: \(reason)\n", stderr)
+                    session.markFailed(reason)
+                    stopSignal.requestStop(reason: "stall")
+                    break
+                }
+
+                nextHealthCheck = Date().addingTimeInterval(1.5)
+            }
+
+            // --- Live heartbeat so you SEE the take is alive ---
+            if Date() >= nextHeartbeat {
+                let health = recorder.health()
+                let mb = Double(health.fileBytes) / 1_048_576.0
+                let clock = formatClock(health.timelineSeconds)
+                let totalWall = formatClock(Date().timeIntervalSince(startedAt))
+                let status = health.isHealthy ? "OK" : "DEAD"
+                fputs(
+                    String(
+                        format: "♥ %@ wall · part %@ · %.1f MB · frames %d · writer %@ · %@\n",
+                        totalWall,
+                        clock,
+                        mb,
+                        health.framesAppended,
+                        health.writerStatus,
+                        status
+                    ),
+                    stderr
+                )
+                nextHeartbeat = Date().addingTimeInterval(5)
+            }
+
             if Date() >= nextMeterLog {
                 meter.logLineIfNeeded()
                 nextMeterLog = Date().addingTimeInterval(1)
@@ -166,6 +308,24 @@ enum ScrecordApp {
                 }
             }
         }
+    }
+
+    private static func formatMinutes(_ minutes: Double) -> String {
+        if minutes == Double(Int(minutes)) {
+            return "\(Int(minutes))m"
+        }
+        return String(format: "%.1fm", minutes)
+    }
+
+    private static func formatClock(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        }
+        return String(format: "%d:%02d", m, s)
     }
 }
 
